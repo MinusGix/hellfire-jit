@@ -1,299 +1,209 @@
-use cranelift::{
-    codegen::{
-        self,
-        binemit::{CodeOffset, NullRelocSink, NullStackMapSink, NullTrapSink},
+use llama::{
+    transforms::{
+        instcombine::LLVMAddInstructionCombiningPass,
+        scalar::{
+            LLVMAddCFGSimplificationPass, LLVMAddGVNPass, LLVMAddIndVarSimplifyPass,
+            LLVMAddLoopUnrollPass, LLVMAddReassociatePass,
+        },
     },
-    frontend::{FunctionBuilder, FunctionBuilderContext, Variable},
-    prelude::{AbiParam, Block, EntityRef, InstBuilder, IntCC, Type, Value},
+    Builder, Const, Context, ExecutionEngine, FuncPassManager, FuncType, Icmp, Module, PassManager,
+    Type, Value,
 };
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{DataContext, Linkage, Module};
 
 use crate::{
-    jit::JIT,
-    util::{make_index_loop, GenerateCode, InitJIT},
+    jit::CodeGen,
+    util::{self, GenerateCode, StaticGetType},
     wrappers::ModifyInPlace,
 };
 
 pub struct InstantiateSliceOptions {
-    /// Is the count known?
+    /// Whether it should log some information, such as the IR before opt
+    /// and the IR after opt, as well as the function pointer.
+    pub log: bool,
+    /// A specific count that we should optimize for.
+    /// The passed in elements when calling *must* have the same number of elements as `count`
     pub count: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-pub enum InstantiateError {}
-
-/// Generates a symbol id that is appended after a given prefix
-/// in order to generate unique names that are consistent as long as you use the same type
-pub(crate) fn generate_name<T: 'static>(prefix: &str) -> String {
-    // TODO: We have an issue in that there may be multiple distinct sub functions of different
-    // types, so we unfortunately have to do this allocation.
-    // We use typeid rather than typename because it has more guarantees on being unique per
-    // type
-
-    // TODO: Can we even rely on the type id's debug impl for this? Making a hash of it
-    // might be a better choice..
-    // I wish cranelift didn't rely on string symbols...
-    let id = std::any::TypeId::of::<T>();
-    format!("{}{:?}", prefix, id)
+#[derive(Debug)]
+pub enum InstantiateError {
+    /// An error from LLVM/llama
+    Llama(llama::Error),
+    /// The function we tried getting out was a nullptr
+    EngineFunctionNull,
+}
+impl From<llama::Error> for InstantiateError {
+    fn from(err: llama::Error) -> Self {
+        InstantiateError::Llama(err)
+    }
 }
 
-pub struct FunctionTranslator<'a, 'b> {
-    pub(crate) pointer_ty: Type,
-    pub(crate) usize_ty: Type,
-    /// &mut Target
-    pub(crate) data_val: Value,
-    pub(crate) builder: &'b mut FunctionBuilder<'a>,
-    pub(crate) module: &'a mut JITModule,
-}
-
-/// Returns the entry block. The builder is switched to it.
-fn make_entry_block(builder: &mut FunctionBuilder) -> Block {
-    let entry_block = builder.create_block();
-    // Add block params for the function parameters
-    builder.append_block_params_for_function_params(entry_block);
-    builder.switch_to_block(entry_block);
-    builder.seal_block(entry_block);
-    entry_block
-}
-
-impl<Target: 'static, Actions: GenerateCode + InitJIT + 'static> ModifyInPlace<Target, Actions> {
+type ModifySliceInPlaceFn<Target> = unsafe extern "C" fn(*mut Target, usize);
+impl<Target: 'static + StaticGetType, Actions: 'static + GenerateCode>
+    ModifyInPlace<Target, Actions>
+{
     /// Instantiate a function over a slice with some statically known data
     pub fn instantiate_slice(
         &self,
         opt: InstantiateSliceOptions,
     ) -> Result<InstantiatedSliceModifyInPlace<Target>, InstantiateError> {
-        let mut jit = JIT::new_with(&self.actions);
-
-        let pointer_ty = jit.module.target_config().pointer_type();
-        let usize_ty = jit.module.target_config().pointer_type();
-
-        // == Create parameters to function
-
-        // The input data parameter
-        jit.ctx
-            .func
-            .signature
-            .params
-            .push(AbiParam::new(pointer_ty));
-
-        // The length parameter, which we'll ignore if we have a constant size
-        // TODO: if we have a constant size then we don't need to include it at all
-        jit.ctx.func.signature.params.push(AbiParam::new(usize_ty));
-
-        // == Build our function
-
-        let mut builder = FunctionBuilder::new(&mut jit.ctx.func, &mut jit.builder_context);
-
-        let entry_block = make_entry_block(&mut builder);
-
-        // Declare parameter variables
-        let data_param_index = 0;
-        let length_param_index = 1;
-
-        let data_var = declare_and_set_variable_to_parameter(
-            &mut builder,
-            entry_block,
-            data_param_index,
-            pointer_ty,
-        );
-        // We keep this even with a constant size, but we could get rid of it
-        // It would be better to have a separate return type for the known count function, though
-        // if we did that
-        let length_var = declare_and_set_variable_to_parameter(
-            &mut builder,
-            entry_block,
-            length_param_index,
-            usize_ty,
-        );
-
-        // Declare some variables for MapInPlace slice
-        let index_index = 2;
-        let index_var = {
-            let index_val = builder.ins().iconst(usize_ty, 0);
-            let index_var = declare_variable(&mut builder, index_index, usize_ty);
-            builder.def_var(index_var, index_val);
-            index_var
+        let cg = {
+            let context = Context::new()?;
+            let module = Module::new(&context, "instantiate_slice")?;
+            let build = Builder::new(&context)?;
+            let engine = ExecutionEngine::new_jit(module, 3)?;
+            CodeGen {
+                context,
+                build,
+                engine,
+            }
         };
 
-        // TODO: We probably need to keep track of alignment too?
-        let target_size: i64 = std::mem::size_of::<Target>().try_into().unwrap();
+        // TODO: Use platform specific usize
+        let void_ty = Type::void(&cg.context)?;
+        let target_pointer_ty = Target::static_get_pointer_type(&cg.context, None)?;
+        let usize_ty = Type::i64(&cg.context)?;
+        // The type of the function
+        let instantiate_ty = FuncType::new(void_ty, [target_pointer_ty, usize_ty])?;
 
-        // TODO: Currently we duplicate the closure given to both functions, because I was unable to
-        // declare it outside of the function and have the compiler infer working lifetimes..
+        let actions = &self.actions;
+        let func = cg.engine.module().declare_function(
+            &cg.build,
+            "instantiate_slice",
+            instantiate_ty,
+            |f| {
+                let params = f.params();
+                let target_data = params[0];
+                // Use the given count if needed
+                let length = if let Some(count) = opt.count {
+                    Value::from(Const::int(usize_ty, count as i64)?)
+                } else {
+                    params[1]
+                };
 
-        // If we have a static count, then generate the loop code based on that rather than length.
-        if let Some(count) = opt.count {
-            // TODO: Don't unwrap
-            let count: i64 = count.try_into().unwrap();
+                // TODO: Check when building the function if the provided count would cause the mul
+                // to overflow. If there was no provided count then check at runtime if the mul
+                // would overflow.
 
-            let count_val = builder.ins().iconst(usize_ty, count);
-            make_index_loop(
-                &mut builder,
-                &mut jit.module,
-                data_var,
-                index_var,
-                count_val,
-                target_size,
-                move |builder, module, _, element_ptr_val| {
-                    let mut trans = FunctionTranslator {
-                        pointer_ty,
-                        usize_ty,
-                        data_val: element_ptr_val,
-                        builder,
-                        module,
-                    };
+                let zero_v = Const::int(usize_ty, 0)?;
+                let one_v = Const::int(usize_ty, 1)?;
+                cg.build.for_loop(
+                    zero_v,
+                    |index| {
+                        cg.build
+                            .icmp(Icmp::LLVMIntULT, index, length, "should_continue")
+                    },
+                    |index| cg.build.add(index, one_v, "next_index"),
+                    |index| {
+                        let data_ptr = cg.build.gep(target_data, &[*index], "element_ptr")?;
+                        // let offset = cg.build.mul(index, target_size_v, "offset_mul")?;
+                        // let data_ptr = cg.build.add(target_data, offset, "data_add")?;
+                        actions.generate_code(&cg, Value::from(data_ptr))?;
+                        Ok(*index)
+                    },
+                )?;
 
-                    self.actions.generate_code(&mut trans);
+                cg.build.ret_void()
+            },
+        )?;
 
-                    // Increment the index
-                    let index_val = builder.use_var(index_var);
-                    let new_index_val = builder.ins().iadd_imm(index_val, 1);
-                    builder.def_var(index_var, new_index_val);
-                },
-            );
-        } else {
-            make_index_loop(
-                &mut builder,
-                &mut jit.module,
-                data_var,
-                index_var,
-                length_var,
-                target_size,
-                move |builder, module, _, element_ptr_val| {
-                    let mut trans = FunctionTranslator {
-                        pointer_ty,
-                        usize_ty,
-                        data_val: element_ptr_val,
-                        builder,
-                        module,
-                    };
-
-                    self.actions.generate_code(&mut trans);
-
-                    // Increment the index
-                    let index_val = builder.use_var(index_var);
-                    let new_index_val = builder.ins().iadd_imm(index_val, 1);
-                    builder.def_var(index_var, new_index_val);
-                },
-            );
+        if opt.log {
+            println!("\n\nPre-Optimized Module: \n{}", cg.engine.module());
         }
 
-        // Return from the function
-        builder.ins().return_(&[]);
+        // Verify the function, just to make sure we don't miss some problems with it
+        func.verify()?;
 
-        // Tell it that we're done with the function
-        builder.finalize();
+        // Instantiate passes for optimizing
+        let fp = FuncPassManager::new(cg.engine.module())?;
+        // TODO: I feel like this should be unsafe, because it literally just runs these passes..
+        // which are just unsafe function pointers
+        // TODO: We can probably add more, and/or let the caller specify expected ones that might
+        // be useful
+        fp.add(&[
+            LLVMAddInstructionCombiningPass,
+            LLVMAddReassociatePass,
+            LLVMAddGVNPass,
+            LLVMAddCFGSimplificationPass,
+            LLVMAddIndVarSimplifyPass,
+            LLVMAddLoopUnrollPass,
+        ]);
+        // Apply the transformations
+        fp.run(&func);
 
-        println!(
-            "Target: {}: {:?}",
-            jit.module.isa().name(),
-            jit.module.isa().triple()
-        );
-        println!("Function Code: \n{}", jit.ctx.func);
-
-        let mut code = Vec::new();
-        jit.ctx
-            .compile_and_emit(
-                jit.module.isa(),
-                &mut code,
-                &mut NullRelocSink {},
-                &mut NullTrapSink {},
-                &mut NullStackMapSink {},
-            )
-            .unwrap();
-
-        println!("Cool Code:");
-        for val in code.iter().rev() {
-            print!("{:02X?} ", val);
+        if opt.log {
+            // Log the IR after optimizations
+            println!("\n\nPost-Optimized Module: \n{}", cg.engine.module());
         }
-        println!("");
-        // Now we have to declare the function to the jit so that it can be called
-        // TODO: This is currently fine since we don't reuse the vm, but we might wish to do that
-        // and that would make this name no longer unique. We probably want to include a hash of the
-        // options along with the type id
-        let name = generate_name::<Target>("slice_instantiate_func");
-        let signature = {
-            let mut sig = jit.module.make_signature();
-            // data
-            sig.params.push(AbiParam::new(pointer_ty));
-            // length
-            sig.params.push(AbiParam::new(usize_ty));
 
-            sig
-        };
-        // TODO: Don't unwrap
-        let id = jit
-            .module
-            .declare_function(&name, Linkage::Export, &signature)
-            .unwrap();
-        // Define the function in the jit
-        // TODO: Don't unwrap
-        let comp = jit
-            .module
-            .define_function(
-                id,
-                &mut jit.ctx,
-                &mut codegen::binemit::NullTrapSink {},
-                &mut codegen::binemit::NullStackMapSink {},
-            )
-            .unwrap();
+        // TODO: Can we have better checks on this to ensure that there wasn't any weirdness?
+        // Get the function pointer that it created, we can't immediately cast it to
+        // `ModifySliceInPlaceFn` because function pointer types can't be null, so we use option
+        // around it, which is suggested by UCG
+        let func: Option<ModifySliceInPlaceFn<Target>> =
+            unsafe { cg.engine.function("instantiate_slice") }?;
+        // If it is null, then that's some unknown error
+        let func = func.ok_or(InstantiateError::EngineFunctionNull)?;
 
-        // Clear the context since we're done
-        jit.module.clear_context(&mut jit.ctx);
-
-        // Finalize the functions we defines, this resolves any relocations still remaining
-        jit.module.finalize_definitions();
-
-        let code = jit.module.get_finalized_function(id);
-        let code: unsafe extern "C" fn(*mut Target, usize) = unsafe {
-            std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut Target, usize)>(code)
+        let inst = unsafe {
+            // Safety:
+            // The given CG was used to create the function
+            // The options were used in the creation/optimization of the code
+            InstantiatedSliceModifyInPlace::new(cg, opt, func)
         };
 
-        Ok(InstantiatedSliceModifyInPlace {
-            jit,
-            options: opt,
-            func: code,
-            size: comp.size,
-        })
+        Ok(inst)
     }
 }
 
-fn declare_and_set_variable_to_parameter(
-    builder: &mut FunctionBuilder,
-    block: Block,
-    parameter_index: usize,
-    typ: Type,
-) -> Variable {
-    let val = builder.block_params(block)[parameter_index];
-    let var = declare_variable(builder, parameter_index, typ);
-    builder.def_var(var, val);
-    var
-}
-
-fn declare_variable(builder: &mut FunctionBuilder, index: usize, typ: Type) -> Variable {
-    let var = Variable::new(index);
-    builder.declare_var(var, typ);
-    var
-}
-
-pub struct InstantiatedSliceModifyInPlace<Target> {
-    // TODO: Do I actually need to keep around the JIT instance?
-    jit: JIT,
+pub struct InstantiatedSliceModifyInPlace<'a, Target> {
+    // TODO: We may not need to keep all of this alive,
+    // TODO: there may be a way to divorce the
+    // ownership (aka make the function live for 'static, like mem::leak)
+    #[allow(dead_code)]
+    /// This must be kept alive for the function to be valid
+    cg: CodeGen<'a>,
+    // TODO: In the future, we might have options which we don't need to keep around for verifying
+    // the safety of the call.
+    /// The options that were given for creating the function.
     options: InstantiateSliceOptions,
     /// (data, length)
     /// SAFETY: This must not hold a pointer/reference to the value behind it after the completion
     /// of the function.
     /// SAFETY: The pointer must point to a valid allocation where we may safely index into each
     /// entry up to length.
-    func: unsafe extern "C" fn(*mut Target, usize),
-    pub size: CodeOffset,
+    func: ModifySliceInPlaceFn<Target>,
 }
-impl<Target> InstantiatedSliceModifyInPlace<Target> {
-    pub(crate) fn get_func(&self) -> unsafe extern "C" fn(*mut Target, usize) {
+impl<'a, Target> InstantiatedSliceModifyInPlace<'a, Target> {
+    /// This is unsafe because construction of this structure has to satisfy contrainsts that are
+    /// hard or impossible to verify.
+    /// # Safety
+    /// `cg` *must* be the [`CodeGen`] instances used to create (and thus owns) `func`
+    /// `options` *must* be the options that were used to create the `func`, and the fields
+    ///     *must* be accurate representations.
+    /// `func` *must* not be a null pointer, and should satisfy the type it is given
+    unsafe fn new(
+        cg: CodeGen<'a>,
+        options: InstantiateSliceOptions,
+        func: ModifySliceInPlaceFn<Target>,
+    ) -> InstantiatedSliceModifyInPlace<'a, Target> {
+        InstantiatedSliceModifyInPlace { cg, options, func }
+    }
+
+    /// Returns the function pointer
+    /// Ideally, this should only be used if you're wanting the function pointer so as to use
+    /// gdb to print the generated assembly.
+    /// # Safety
+    /// SAFETY: Note that this pointer is only valid as long as this structure is valid, since
+    /// once this structure is dropped, the memory that the function resides at will be freed.
+    /// SAFETY: For calling, you must satisfy the safety constraints of
+    /// [`Self::call_mut_unchecked_parts`]
+    pub fn get_func_unchecked(&self) -> ModifySliceInPlaceFn<Target> {
         self.func
     }
 
+    /// # Panics
+    /// If any of the expected constraints are invalid
     pub fn call_mut(&self, data: &mut [Target]) {
         // Thus must be checked in order to guarantee safety
         if let Some(count) = self.options.count {

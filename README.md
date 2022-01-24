@@ -1,61 +1,49 @@
 # Hellfire-JIT
-This is a probably abandoned project.  
-The idea was to have a way to specify actions that should be taken with some data, and specify things which are held constant, which it would then use to perform optimizations with the generated code.  
+**NOTE: This library likely has undefined behavior if it is used incorrectly. That will hopefully be made safer as time goes on.**
+
+The idea behind this project is for generating code at *run-time* with some given information about what it can assume.  
+The library works by including LLVM and using that to generate and optimize code. This is obviously not cheap in terms of the dependencies that one must include, and not cheap in terms of generating code, but it works.  
+This project initially used Cranelift, which has benefits of being pure-rust (and so harder to mess up the API, though still entirely possible to mess up the generated code), but doesn't seem to be good enough at optimizations for this library.  
+Obviously, generating code is not an option always, but it could help get some extra performance out of complex actions if you do them often enough to offset the cost of generating code. That said, since LLVM is not exactly made for the very fast compilation that JITs rather like, this library is more of a proof-of-concept and probably is not something you typically want to use.  
+  
+## Example Usage:
 ```rust
-// Create a query that modifies a u64, by subtracting and then adding
+// Read in some runtime data. In this case, space separated integers
+let data = std::fs::read_to_string("./data.txt").unwrap();
+let mut data = data
+    .split(' ')
+    .map(|x| x.parse::<u64>())
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+let count = data.len();
+// A query that modifies a u64, subtracting and adding some amount
 let query: ModifyInPlace<u64, (Sub<u64>, Add<u64>)> =
     ModifyInPlace::new((Sub::new(2u64), Add::new(1)));
-// Instantiate the function to operate on a slice of u64
-let func = query
-    // count allows us to specify a requirement that the slice has a specific size
-    // in order to facilitate optimizations
-    .instantiate_slice(InstantiateSliceOptions { count: Some(count) })
+// Instantiate the function to operate over a slice, so operate on &[u64]
+let func: InstantiatedSliceModifyInPlace<u64> = query
+    .instantiate_slice(InstantiateSliceOptions {
+        // Whether to log some information, like the initially generated IR and the IR after optimization
+        log: true,
+        // A statically known count. This specifies the expected length that the slice will be, and so LLVM
+        // can optimize based on that.
+        count: Some(count),
+    })
     .unwrap();
 
+// Open GDB, start, and then press next until you see the ptr
+// then you can do `disas 0xblah` to get the assembly code
+// Though, as the methods comments mention, calling the function pointer directly is unsafe
+println!(
+    "Function Pointer: 0x{:X}",
+    func.get_func_unchecked() as *const () as usize
+);
 
 println!("Data Before: {:?}", data);
-// Calling this function is safe because it asserts that the count is correct
-// and it is given mutable (unique) access to it
+// However, this is safe to call (assuming the generated code isn't bad, but it tries not to be)
+// because it asserts that the requirements are met.
+// It would be nice to have some typesafe way of constructing a wrapper type.
 func.call_mut(&mut data);
 println!("Data After:  {:?}", data);
 ```
-That's basically all that exists in it. If this project was continued, more complex ways of specifying actions (such as using a compile-time 'reflection' crate to allow efficient field-setting) could be made.  
-Sadly, Cranelift (which is what I chose, due to it being in Rust), doesn't perform many optimizations. The above code takes in 14 elements and generates this ir:
-```
-function u0:0(i64, i64) system_v {
-block0(v0: i64, v1: i64):
-    v5 -> v0
-    v2 = iconst.i64 0
-    v3 = iconst.i64 14
-    jump block1(v2)
-
-block1(v4: i64):
-    br_icmp uge v4, v3, block3
-    jump block2
-
-block2:
-    v6 = imul_imm.i64 v4, 8
-    v7 = iadd v6, v5
-    v8 = load.i64 v7
-    v9 = iconst.i64 1
-    v10 = iadd v8, v9
-    store v10, v7
-    v11 = load.i64 v7
-    v12 = iconst.i64 2
-    v13 = isub v11, v12
-    store v13, v7
-    v14 = iadd_imm.i64 v4, 1
-    jump block1(v14)
-
-block3:
-    return
-}
-```
-Unfortunately, Cranelift doesn't optmize it that well, and it becomes a for loop like:
-```C
-for (int i = 0; i < 14; i++) {
-    data[i] = data[i] - 2;
-    data[i] = data[i] + 1;
-}
-```
-without collapsing those add/subs or unrolling the loop.
+As long as the `func` instance is alive, the function pointer can be repeatedly called.  
+The query can also be reused.  
